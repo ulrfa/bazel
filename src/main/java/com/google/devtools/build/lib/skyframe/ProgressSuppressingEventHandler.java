@@ -18,9 +18,10 @@ import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
 
 /**
- * Suppresses {@link #post} when the provided {@link Postable} represents a progress event (denoted
- * by a return of {@code false} from {@link Postable#storeForReplay}), but otherwise delegates calls
- * to its wrapped {@link ExtendedEventHandler}.
+ * Suppresses {@link #post} when the provided {@link Postable} should not be emitted again while a
+ * rewound action is being re-evaluated (denoted by a return of {@code true} from {@link
+ * Postable#suppressOnRewind}), but otherwise delegates calls to its wrapped {@link
+ * ExtendedEventHandler}.
  */
 final class ProgressSuppressingEventHandler implements ExtendedEventHandler {
   private final ExtendedEventHandler delegate;
@@ -31,7 +32,7 @@ final class ProgressSuppressingEventHandler implements ExtendedEventHandler {
 
   @Override
   public void post(Postable obj) {
-    if (obj.storeForReplay()) {
+    if (!obj.suppressOnRewind()) {
       delegate.post(obj);
     }
   }

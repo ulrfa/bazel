@@ -489,6 +489,9 @@ public class BuildWithoutTheBytesIntegrationTest extends BuildWithoutTheBytesInt
     // missing from the CAS, emulating a remote cache without integrity checks. Rewinding must not
     // accept such an action result for a rewound action, as it would reinstate the stale metadata
     // of the lost blob instead of regenerating it.
+    //
+    // The chain is long enough that a rewound action discovers a further lost input while being
+    // re-executed, so that rewinding has to recurse.
     var unverifiedWorker = IntegrationTestUtils.createWorker("--noaction_cache_integrity_check");
     try (var ignored = unverifiedWorker.start()) {
       addOptions("--remote_executor=grpc://localhost:" + unverifiedWorker.getPort());
@@ -505,31 +508,41 @@ public class BuildWithoutTheBytesIntegrationTest extends BuildWithoutTheBytesInt
 
           genrule(
               name = "bar",
-              srcs = [
-                  ":foo",
-                  "bar.in",
-              ],
+              srcs = [":foo"],
               outs = ["bar.out"],
-              cmd = "cat $(location :foo) $(location bar.in) > $@",
+              cmd = "cat $(location :foo) > $@ && echo -n bar >> $@",
+          )
+
+          genrule(
+              name = "baz",
+              srcs = [
+                  ":bar",
+                  "baz.in",
+              ],
+              outs = ["baz.out"],
+              cmd = "cat $(location :bar) $(location baz.in) > $@",
           )
           """);
-      write("a/bar.in", "bar");
+      write("a/baz.in", "baz");
 
-      buildTarget("//a:bar");
+      buildTarget("//a:baz");
 
-      // Delete the blob backing foo.out from the CAS while keeping all action cache entries.
+      // Delete the blobs backing foo.out and bar.out from the CAS while keeping all action cache
+      // entries.
       unverifiedWorker.evictBlob("foo".getBytes(UTF_8));
+      unverifiedWorker.evictBlob("foobar".getBytes(UTF_8));
       if (useDiskCache) {
-        // Prevent the disk cache from restoring the deleted blob.
+        // Prevent the disk cache from restoring the deleted blobs.
         addOptions("--disk_cache=" + UUID.randomUUID());
       }
 
-      // Invalidate only //a:bar so that its execution discovers the lost input and rewinds //a:foo.
-      write("a/bar.in", "bar2");
+      // Invalidate only //a:baz, so that its execution discovers bar.out as lost and rewinds
+      // //a:bar, whose re-execution then discovers foo.out as lost and rewinds //a:foo.
+      write("a/baz.in", "baz2");
       setDownloadToplevel();
-      buildTarget("//a:bar");
+      buildTarget("//a:baz");
 
-      assertValidOutputFile("a/bar.out", "foobar2\n");
+      assertValidOutputFile("a/baz.out", "foobarbaz2\n");
     }
   }
 
