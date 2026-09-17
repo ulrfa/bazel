@@ -313,6 +313,11 @@ public class UploadManifest {
     return digestToFile;
   }
 
+  /** Returns the digests this manifest uploads. */
+  public ImmutableSet<Digest> getDigests() {
+    return Sets.union(digestToBlobs.keySet(), digestToFile.keySet()).immutableCopy();
+  }
+
   @Nullable
   public Digest getStdoutDigest() {
     return stdoutDigest;
@@ -605,7 +610,7 @@ public class UploadManifest {
       ExtendedEventHandler reporter)
       throws IOException, InterruptedException, ExecException {
     ActionExecutionMetadata action = context.getSpawnOwner();
-    var allDigests = Sets.union(digestToBlobs.keySet(), digestToFile.keySet()).immutableCopy();
+    var allDigests = getDigests();
 
     var uploadFutures = new ArrayList<ListenableFuture<Void>>();
 

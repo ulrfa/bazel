@@ -1459,6 +1459,17 @@ public final class RemoteModule extends BlazeModule {
     return actionContextProvider;
   }
 
+  /**
+   * Returns how many digests are recorded as missing from the CAS.
+   *
+   * <p>Lives here rather than on {@link RemoteActionContextProvider} so that it can be read after
+   * the command, once {@link #afterCommand} has dropped that reference.
+   */
+  @VisibleForTesting
+  int getKnownMissingCasDigestsSize() {
+    return knownMissingCasDigests.size();
+  }
+
   @VisibleForTesting
   RepositoryRemoteHelpersFactory getRepositoryRemoteHelpersFactoryDelegate() {
     return repositoryRemoteHelpersFactoryDelegate;

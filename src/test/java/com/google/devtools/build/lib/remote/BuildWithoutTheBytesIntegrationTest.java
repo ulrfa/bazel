@@ -13,27 +13,36 @@
 // limitations under the License.
 package com.google.devtools.build.lib.remote;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.TruthJUnit.assume;
+import static com.google.devtools.build.lib.skyframe.rewinding.RewindingTestsHelper.rewoundArtifactOwnerLabels;
 import static com.google.devtools.build.lib.vfs.FileSystemUtils.readContent;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertThrows;
 
+import build.bazel.remote.execution.v2.Digest;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
+import com.google.common.eventbus.Subscribe;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.BuildFailedException;
+import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.authandtls.credentialhelper.CredentialModule;
+import com.google.devtools.build.lib.buildtool.buildevent.ExecutionPhaseCompleteEvent;
 import com.google.devtools.build.lib.dynamic.DynamicExecutionModule;
 import com.google.devtools.build.lib.remote.options.RemoteStartupOptions;
-import com.google.devtools.build.lib.remote.util.IntegrationTestUtils;
 import com.google.devtools.build.lib.remote.util.IntegrationTestUtils.WorkerInstance;
+import com.google.devtools.build.lib.remote.util.IntegrationTestUtils;
 import com.google.devtools.build.lib.runtime.BlazeModule;
 import com.google.devtools.build.lib.runtime.BlazeRuntime;
 import com.google.devtools.build.lib.runtime.BlockWaitingModule;
 import com.google.devtools.build.lib.runtime.BuildSummaryStatsModule;
 import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.skyframe.rewinding.RewindingTestsHelper;
 import com.google.devtools.build.lib.standalone.StandaloneModule;
+import com.google.devtools.build.lib.testutil.ActionEventRecorder;
 import com.google.devtools.build.lib.util.OS;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
@@ -43,6 +52,7 @@ import com.google.devtools.common.options.OptionsBase;
 import com.google.testing.junit.testparameterinjector.TestParameter;
 import com.google.testing.junit.testparameterinjector.TestParameterInjector;
 import java.io.IOException;
+import java.util.List;
 import java.util.UUID;
 import org.junit.ClassRule;
 import org.junit.Rule;
@@ -52,7 +62,47 @@ import org.junit.runner.RunWith;
 /** Integration tests for Build without the Bytes. */
 @RunWith(TestParameterInjector.class)
 public class BuildWithoutTheBytesIntegrationTest extends BuildWithoutTheBytesIntegrationTestBase {
+
   @ClassRule @Rule public static final WorkerInstance worker = IntegrationTestUtils.createWorker();
+
+  private final RewindingTestsHelper rewindingTestsHelper =
+      new RewindingTestsHelper(this, new ActionEventRecorder());
+
+  /**
+   * Records how many digests {@code knownMissingCasDigests} holds when execution finishes, which is
+   * before {@code onBuildComplete} may clear it. Set again by every build, so read it before the
+   * next one starts.
+   */
+  private final class AtExecutionPhaseComplete {
+    private volatile int knownMissingCasDigestsSize = -1;
+
+    @Subscribe
+    public void onExecutionPhaseComplete(ExecutionPhaseCompleteEvent event) {
+      knownMissingCasDigestsSize = knownMissingCasDigestsSize();
+    }
+  }
+
+  /** Returns how many digests the live {@link RemoteModule} believes are missing from the CAS. */
+  private int knownMissingCasDigestsSize() {
+    for (BlazeModule module : getRuntime().getBlazeModules()) {
+      if (module instanceof RemoteModule remoteModule) {
+        return remoteModule.getKnownMissingCasDigestsSize();
+      }
+    }
+    throw new AssertionError("no RemoteModule in the runtime");
+  }
+
+  /** Returns the labels of actions whose spawns were all served from a cache. */
+  private static ImmutableList<String> cacheHitLabels(ActionEventRecorder recorder) {
+    return recorder.getActionResultReceivedEvents().stream()
+        .filter(
+            event ->
+                !event.getActionResult().spawnResults().isEmpty()
+                    && event.getActionResult().spawnResults().stream()
+                        .allMatch(SpawnResult::isCacheHit))
+        .map(event -> event.getAction().getOwner().getLabel().getCanonicalForm())
+        .collect(toImmutableList());
+  }
 
   @TestParameter public boolean useDiskCache;
   private Path diskCacheDir;
@@ -118,6 +168,8 @@ public class BuildWithoutTheBytesIntegrationTest extends BuildWithoutTheBytesInt
     return super.getRuntimeBuilder()
         .addBlazeModule(new RemoteModule())
         .addBlazeModule(new BuildSummaryStatsModule())
+        .addBlazeModule(
+            rewindingTestsHelper.makeControllableActionStrategyModule("remote", "standalone"))
         .addBlazeModule(new BlockWaitingModule());
   }
 
@@ -496,6 +548,9 @@ public class BuildWithoutTheBytesIntegrationTest extends BuildWithoutTheBytesInt
     try (var ignored = unverifiedWorker.start()) {
       addOptions("--remote_executor=grpc://localhost:" + unverifiedWorker.getPort());
       enableActionRewinding();
+      // Upload synchronously, so that the digest removal in doUploadOutputs is ordered before the
+      // action completes and cannot race the sampling at the end of the execution phase.
+      addOptions("--noremote_cache_async");
       write(
           "a/BUILD",
           """
@@ -540,9 +595,166 @@ public class BuildWithoutTheBytesIntegrationTest extends BuildWithoutTheBytesInt
       // //a:bar, whose re-execution then discovers foo.out as lost and rewinds //a:foo.
       write("a/baz.in", "baz2");
       setDownloadToplevel();
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+      var atExecutionPhaseComplete = new AtExecutionPhaseComplete();
+      getRuntimeWrapper().registerSubscriber(atExecutionPhaseComplete);
       buildTarget("//a:baz");
 
+      // Each action is rewound exactly once. Removing a digest from knownMissingCasDigests while
+      // rejecting an entry would let the next lookup re-accept //a:bar's stale entry, rewinding it
+      // a second time.
+      assertThat(rewoundArtifactOwnerLabels(rewoundKeys)).containsExactly("//a:bar", "//a:foo");
       assertValidOutputFile("a/baz.out", "foobarbaz2\n");
+      // Sampled before the build completes, since completion clears the set. Both rewound actions
+      // ran remotely, so processing their ExecuteResponses is what dropped the digests.
+      assertThat(atExecutionPhaseComplete.knownMissingCasDigestsSize).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void actionRewinding_localReupload_dropsLostDigests(
+      @TestParameter boolean uploadLocalResults) throws Exception {
+    // A locally re-executed action reaches the caches through doUploadOutputs rather than through an
+    // ExecuteResponse. Its digests must be dropped either way: with uploads enabled the blob goes to
+    // the remote cache, and with them disabled it still goes to the disk cache, which is read before
+    // the remote one. Without a disk cache and with uploads disabled nothing is written at all, so
+    // that combination is skipped.
+    assume().that(uploadLocalResults || useDiskCache).isTrue();
+    var unverifiedWorker = IntegrationTestUtils.createWorker("--noaction_cache_integrity_check");
+    try (var ignored = unverifiedWorker.start()) {
+      addOptions("--remote_executor=grpc://localhost:" + unverifiedWorker.getPort());
+      enableActionRewinding();
+      // Upload synchronously, so that the digest removal in doUploadOutputs is ordered before the
+      // action completes and cannot race the sampling at the end of the execution phase.
+      addOptions("--noremote_cache_async");
+      write(
+          "a/BUILD",
+          """
+          genrule(
+              name = "bar",
+              srcs = [],
+              outs = ["bar.out"],
+              cmd = "echo -n bar > $@",
+          )
+
+          genrule(
+              name = "consumer",
+              srcs = [
+                  ":bar.out",
+                  "consumer.in",
+              ],
+              outs = ["consumer.out"],
+              cmd = "cat $(location :bar.out) $(location consumer.in) > $@",
+          )
+          """);
+      write("a/consumer.in", "one");
+
+      buildTarget("//a:consumer");
+
+      // Delete the blob backing bar.out, keeping //a:bar's action cache entry.
+      unverifiedWorker.evictBlob("bar".getBytes(UTF_8));
+      if (useDiskCache) {
+        addOptions("--disk_cache=" + UUID.randomUUID());
+      }
+
+      // Invalidate only //a:consumer, so its execution finds bar.out lost and rewinds //a:bar.
+      write("a/consumer.in", "two");
+      setDownloadToplevel();
+      addOptions(
+          "--strategy_regexp=.*=standalone",
+          "--remote_upload_local_results=" + uploadLocalResults);
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+      var atExecutionPhaseComplete = new AtExecutionPhaseComplete();
+      getRuntimeWrapper().registerSubscriber(atExecutionPhaseComplete);
+      buildTarget("//a:consumer");
+
+      assertThat(rewoundArtifactOwnerLabels(rewoundKeys)).containsExactly("//a:bar");
+      // Sampled before the build completes, since completion clears the set.
+      assertThat(atExecutionPhaseComplete.knownMissingCasDigestsSize).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void actionRewinding_unrelatedFailure_dropsLostDigests() throws Exception {
+    // Nothing writes the regenerated output here: uploads are off and there is no disk cache, so the
+    // digest is still recorded as missing when the build fails. The failure is a plain non-zero exit
+    // rather than a cache eviction, so no retry is coming and the digests are of no further use.
+    // Once the blob is back in the CAS, //a:bar's surviving action cache entry must be usable again,
+    // which it is only if completing the build forgot the digest.
+    assume().that(useDiskCache).isFalse();
+    var unverifiedWorker = IntegrationTestUtils.createWorker("--noaction_cache_integrity_check");
+    try (var ignored = unverifiedWorker.start()) {
+      addOptions("--remote_executor=grpc://localhost:" + unverifiedWorker.getPort());
+      enableActionRewinding();
+      // Upload synchronously, so that the digest removal in doUploadOutputs is ordered before the
+      // action completes and cannot race the sampling at the end of the execution phase.
+      addOptions("--noremote_cache_async");
+      write(
+          "a/BUILD",
+          """
+          genrule(
+              name = "bar",
+              srcs = [],
+              outs = ["bar.out"],
+              cmd = "echo -n bar > $@",
+          )
+
+          genrule(
+              name = "consumer",
+              srcs = [
+                  ":bar.out",
+                  "consumer.in",
+              ],
+              outs = ["consumer.out"],
+              cmd = "cat $(location :bar.out) $(location consumer.in) > $@",
+          )
+
+          genrule(
+              name = "fail",
+              srcs = [":consumer.out"],
+              outs = ["fail.out"],
+              cmd = "exit 1",
+          )
+          """);
+      write("a/consumer.in", "one");
+
+      buildTarget("//a:consumer");
+
+      // Delete the blob backing bar.out, keeping //a:bar's action cache entry.
+      byte[] barContents = "bar".getBytes(UTF_8);
+      unverifiedWorker.evictBlob(barContents);
+
+      // Invalidate only //a:consumer, so its execution finds bar.out lost and rewinds //a:bar.
+      write("a/consumer.in", "two");
+      setDownloadToplevel();
+      addOptions(
+          "--strategy_regexp=.*=standalone",
+          "--notrack_incremental_state",
+          "--remote_upload_local_results=false");
+      var rewoundKeys = rewindingTestsHelper.collectOrderedRewoundKeys();
+      var atExecutionPhaseComplete = new AtExecutionPhaseComplete();
+      getRuntimeWrapper().registerSubscriber(atExecutionPhaseComplete);
+      assertThrows(BuildFailedException.class, () -> buildTarget("//a:fail"));
+      assertThat(rewoundArtifactOwnerLabels(rewoundKeys)).containsExactly("//a:bar");
+      // The regenerated output went nowhere, so the digest is still recorded when execution ends,
+      // and completing the build is what drops it.
+      assertThat(atExecutionPhaseComplete.knownMissingCasDigestsSize).isEqualTo(1);
+      assertThat(knownMissingCasDigestsSize()).isEqualTo(0);
+
+      // Put the blob back, as another build writing the same output would.
+      Path restoredBlob = getFileSystem().getPath(unverifiedWorker.getCasBlobPath(barContents));
+      restoredBlob.getParentDirectory().createDirectoryAndParents();
+      FileSystemUtils.writeContent(restoredBlob, barContents);
+
+      // Delete the locally regenerated outputs and change //a:consumer's input, so the next build
+      // must re-evaluate and cannot reuse local state, forcing //a:bar's entry to be looked up.
+      getOutputPath("a/bar.out").delete();
+      getOutputPath("a/consumer.out").delete();
+      write("a/consumer.in", "three");
+      ActionEventRecorder actionEventRecorder = new ActionEventRecorder();
+      getRuntimeWrapper().registerSubscriber(actionEventRecorder);
+      buildTarget("//a:consumer");
+      assertThat(cacheHitLabels(actionEventRecorder)).containsExactly("//a:bar");
     }
   }
 

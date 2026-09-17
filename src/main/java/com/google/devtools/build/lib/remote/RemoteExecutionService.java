@@ -27,6 +27,7 @@ import static com.google.devtools.build.lib.remote.util.BulkTransfers.waitForBul
 import static com.google.devtools.build.lib.remote.util.Futures.getFromFuture;
 import static com.google.devtools.build.lib.remote.util.Utils.createExecExceptionForCredentialHelperException;
 import static com.google.devtools.build.lib.remote.util.Utils.grpcAwareErrorMessage;
+import static com.google.devtools.build.lib.util.ExitCode.REMOTE_CACHE_EVICTED;
 import static com.google.devtools.build.lib.util.StringEncoding.internalToUnicode;
 import static com.google.devtools.build.lib.util.StringEncoding.unicodeToInternal;
 import static java.util.Collections.min;
@@ -816,7 +817,7 @@ public class RemoteExecutionService {
       // cache, or doesn't implement AC integrity check.
       //
       // See https://github.com/bazelbuild/bazel/issues/18696.
-      if (updateKnownMissingCasDigests(knownMissingCasDigests, metadata)) {
+      if (referencesKnownMissingCasDigest(knownMissingCasDigests, metadata)) {
         return null;
       }
     }
@@ -836,6 +837,28 @@ public class RemoteExecutionService {
       return PathFragment.create(outputPath);
     }
     return null;
+  }
+
+  /**
+   * Returns whether any digest referenced by {@code metadata} is in {@code knownMissingCasDigests}.
+   *
+   * <p>Unlike {@link #updateKnownMissingCasDigests}, this does not modify the set.
+   */
+  private static boolean referencesKnownMissingCasDigest(
+      Set<Digest> knownMissingCasDigests, ActionResultMetadata metadata) {
+    for (var file : metadata.files()) {
+      if (knownMissingCasDigests.contains(file.digest())) {
+        return true;
+      }
+    }
+    for (var entry : metadata.directories()) {
+      for (var file : entry.getValue().files()) {
+        if (knownMissingCasDigests.contains(file.digest())) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /**
@@ -1919,6 +1942,14 @@ public class RemoteExecutionService {
     try (SilentCloseable c =
         Profiler.instance().profile(ProfilerTask.UPLOAD_TIME, "upload outputs")) {
       UploadManifest manifest = buildUploadManifest(action, spawnResult);
+      // The digests are no longer missing once uploaded, and removing them from
+      // knownMissingCasDigests restores its isEmpty() fast paths and frees the memory. The rewound
+      // action has completed and its output files are stored locally, so remembering them as
+      // missing is no longer needed, so this can be done speculatively, before the upload
+      // completes, to take effect earlier.
+      if (!knownMissingCasDigests.isEmpty()) {
+        knownMissingCasDigests.removeAll(manifest.getDigests());
+      }
       var unused =
           manifest.upload(action.getRemoteActionExecutionContext(), combinedCache, reporter);
     } catch (IOException e) {
@@ -2123,9 +2154,12 @@ public class RemoteExecutionService {
 
   @Subscribe
   public void onBuildComplete(BuildCompleteEvent event) {
-    if (event.getResult().getSuccess()) {
-      // If build succeeded, clear knownMissingCasDigests in case there are missing digests from
-      // other targets from previous builds which are not relevant anymore.
+    // The digests are only of use to a subsequent attempt at the same build, which
+    // BlazeCommandDispatcher starts when the build ends with REMOTE_CACHE_EVICTED. Keeping them past
+    // any other outcome would reject action cache entries for the rest of the server's lifetime,
+    // even once the blobs are back: a build that fails for an unrelated reason will fail its retry
+    // too, so nothing is going to consult them.
+    if (!event.getResult().getDetailedExitCode().getExitCode().equals(REMOTE_CACHE_EVICTED)) {
       knownMissingCasDigests.clear();
     }
   }
